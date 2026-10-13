@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: email-extractor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 180 --workers 1
