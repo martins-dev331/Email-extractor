@@ -1,4 +1,5 @@
-import csv, io, re, uuid
+import csv, html, io, re, uuid
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -11,7 +12,9 @@ app = Flask(__name__)
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 BAD_END = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js")
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EmailExtractor/1.0)"}
-PATHS = ["", "/contact", "/contact-us", "/about"]
+PATHS = ["", "/contact", "/contact-us", "/contact.html", "/contact-us.html",
+         "/about", "/about-us", "/get-in-touch"]
+JUNK = ("sentry", "wixpress", "example.", "domain.com", "yourdomain", "email.com", "u003e")
 MAX_SITES = 100
 CACHE = {}
 
@@ -20,20 +23,51 @@ def norm_url(u):
     u = u.strip().strip(",;\"'")
     if not u or " " in u:
         return ""
-    return u if u.startswith("http") else "http://" + u
+    u = u if u.startswith("http") else "http://" + u
+    p = urlparse(u)
+    return f"{p.scheme}://{p.netloc}/" if p.netloc else ""
+
+
+@lru_cache(maxsize=512)
+def robots_for(origin):
+    try:
+        r = requests.get(origin + "/robots.txt", headers=HEADERS, timeout=5)
+        if r.status_code != 200:
+            return None
+        rp = RobotFileParser()
+        rp.parse(r.text.splitlines())
+        return rp
+    except Exception:
+        return None
 
 
 def allowed(url):
+    p = urlparse(url)
+    rp = robots_for(f"{p.scheme}://{p.netloc}")
+    return True if rp is None else rp.can_fetch(HEADERS["User-Agent"], url)
+
+
+def decode_cf(hexstr):
     try:
-        p = urlparse(url)
-        r = requests.get(f"{p.scheme}://{p.netloc}/robots.txt", headers=HEADERS, timeout=5)
-        if r.status_code != 200:
-            return True
-        rp = RobotFileParser()
-        rp.parse(r.text.splitlines())
-        return rp.can_fetch(HEADERS["User-Agent"], url)
+        b = bytes.fromhex(hexstr)
+        return "".join(chr(c ^ b[0]) for c in b[1:])
     except Exception:
-        return True
+        return ""
+
+
+def extract_from_html(raw):
+    emails, phones = set(), set()
+    soup = BeautifulSoup(raw, "html.parser")
+    for a in soup.select('a[href^="mailto:"]'):
+        emails.update(EMAIL_RE.findall(html.unescape(a["href"])))
+    for a in soup.select('a[href^="tel:"]'):
+        phones.add(a["href"][4:].strip())
+    for el in soup.select("[data-cfemail]"):
+        emails.update(EMAIL_RE.findall(decode_cf(el["data-cfemail"])))
+    emails.update(EMAIL_RE.findall(html.unescape(raw)))  # raw source: catches script/JSON data
+    clean = {e.lower().strip(".") for e in emails}
+    clean = {e for e in clean if not e.endswith(BAD_END) and not any(j in e for j in JUNK) and len(e) < 80}
+    return clean, phones
 
 
 def scrape(site):
@@ -47,16 +81,12 @@ def scrape(site):
             r = requests.get(url, headers=HEADERS, timeout=8)
             if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
                 continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            for a in soup.select('a[href^="mailto:"]'):
-                emails.update(EMAIL_RE.findall(a["href"]))
-            for a in soup.select('a[href^="tel:"]'):
-                phones.add(a["href"][4:].strip())
-            emails.update(EMAIL_RE.findall(soup.get_text(" ")))
+            e, p = extract_from_html(r.text)
+            emails |= e
+            phones |= p
         except Exception:
             continue
-    emails = sorted(e.lower() for e in emails if not e.lower().endswith(BAD_END))
-    return {"website": site, "emails": ", ".join(emails), "phones": ", ".join(sorted(phones))}
+    return {"website": site, "emails": ", ".join(sorted(emails)), "phones": ", ".join(sorted(phones))}
 
 
 def urls_from_csv(data):
